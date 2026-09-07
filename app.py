@@ -1,1997 +1,249 @@
-import json
-import re
-import socket
-import ssl
-import time
+import json, re, socket, ssl, time
 from urllib.parse import urljoin, urlparse
-
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from google import genai
-from playwright.sync_api import sync_playwright
 
+st.set_page_config(page_title="AI Website Auditor", page_icon="🔎", layout="wide")
+UA = "AI-Website-Auditor/2.0"
+TIMEOUT = 20
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-st.set_page_config(
-    page_title="AI Website Auditor",
-    page_icon="🔎",
-    layout="wide",
-)
-
-USER_AGENT = "AI-Website-Auditor/1.0"
-REQUEST_TIMEOUT = 20
-
-
-# ============================================================
-# URL HELPERS
-# ============================================================
-
-def normalize_url(url: str) -> str:
+def normalize_url(url):
     url = url.strip()
-
-    if not url:
-        raise ValueError("Please enter a website URL.")
-
-    if not re.match(r"^https?://", url, re.IGNORECASE):
-        url = "https://" + url
-
-    parsed = urlparse(url)
-
-    if not parsed.netloc:
-        raise ValueError("Invalid website URL.")
-
+    if not url: raise ValueError("Please enter a website URL.")
+    if not re.match(r"^https?://", url, re.I): url = "https://" + url
+    p = urlparse(url)
+    if p.scheme not in ("http","https") or not p.netloc: raise ValueError("Enter a valid HTTP/HTTPS URL.")
     return url
 
-
-# ============================================================
-# BASIC HTTP FETCH
-# ============================================================
-
-def fetch_website(url):
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml",
-    }
-
+def fetch(url):
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
     start = time.perf_counter()
+    r = s.get(url, timeout=TIMEOUT, allow_redirects=True)
+    return r, time.perf_counter()-start
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=REQUEST_TIMEOUT,
-        allow_redirects=True,
-    )
-
-    elapsed = time.perf_counter() - start
-
-    return response, elapsed
-
-
-# ============================================================
-# SEO / HTML ANALYSIS
-# ============================================================
-
-def analyze_html(url, response):
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    parsed = urlparse(response.url)
-
-    # -------------------------
-    # Title
-    # -------------------------
-
-    title_tag = soup.find("title")
-
-    title = (
-        title_tag.get_text(" ", strip=True)
-        if title_tag
-        else ""
-    )
-
-    # -------------------------
-    # Meta description
-    # -------------------------
-
-    meta_description_tag = soup.find(
-        "meta",
-        attrs={"name": re.compile("^description$", re.I)}
-    )
-
-    meta_description = (
-        meta_description_tag.get("content", "").strip()
-        if meta_description_tag
-        else ""
-    )
-
-    # -------------------------
-    # Canonical
-    # -------------------------
-
-    canonical_tag = soup.find(
-        "link",
-        rel=lambda value:
-        value and "canonical" in value
-    )
-
-    canonical = (
-        canonical_tag.get("href", "").strip()
-        if canonical_tag
-        else ""
-    )
-
-    # -------------------------
-    # Robots
-    # -------------------------
-
-    robots_tag = soup.find(
-        "meta",
-        attrs={"name": re.compile("^robots$", re.I)}
-    )
-
-    robots = (
-        robots_tag.get("content", "").strip()
-        if robots_tag
-        else ""
-    )
-
-    # -------------------------
-    # Viewport
-    # -------------------------
-
-    viewport_tag = soup.find(
-        "meta",
-        attrs={"name": re.compile("^viewport$", re.I)}
-    )
-
-    viewport = (
-        viewport_tag.get("content", "").strip()
-        if viewport_tag
-        else ""
-    )
-
-    # -------------------------
-    # Language
-    # -------------------------
-
-    html_tag = soup.find("html")
-
-    language = (
-        html_tag.get("lang")
-        if html_tag
-        else None
-    )
-
-    # -------------------------
-    # Headings
-    # -------------------------
-
-    headings = {}
-
-    for level in range(1, 7):
-        headings[f"h{level}"] = len(
-            soup.find_all(f"h{level}")
-        )
-
-    # -------------------------
-    # Images
-    # -------------------------
-
+def analyze_html(r):
+    soup = BeautifulSoup(r.text, "html.parser")
+    p = urlparse(r.url)
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    md = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
+    desc = md.get("content","").strip() if md else ""
+    can = soup.find("link", rel=lambda x: x and "canonical" in x)
+    robots = soup.find("meta", attrs={"name": re.compile("^robots$", re.I)})
+    viewport = soup.find("meta", attrs={"name": re.compile("^viewport$", re.I)})
+    html = soup.find("html")
     images = soup.find_all("img")
-
-    images_without_alt = []
-
-    for img in images:
-
-        alt = img.get("alt")
-
-        if not alt or not alt.strip():
-
-            images_without_alt.append(
-                img.get("src", "")[:250]
-            )
-
-    # -------------------------
-    # Links
-    # -------------------------
-
+    no_alt = [urljoin(r.url, x.get("src",""))[:300] for x in images if not x.get("alt","").strip()]
     links = soup.find_all("a", href=True)
-
-    internal_links = 0
-    external_links = 0
-
-    for link in links:
-
-        href = urljoin(
-            response.url,
-            link["href"]
-        )
-
-        parsed_link = urlparse(href)
-
-        if not parsed_link.netloc:
-            continue
-
-        if parsed_link.netloc == parsed.netloc:
-            internal_links += 1
-
-        else:
-            external_links += 1
-
-    # -------------------------
-    # Scripts
-    # -------------------------
-
-    scripts = soup.find_all(
-        "script",
-        src=True
-    )
-
-    # -------------------------
-    # Stylesheets
-    # -------------------------
-
-    stylesheets = soup.find_all(
-        "link",
-        rel=lambda value:
-        value and "stylesheet" in value
-    )
-
-    # -------------------------
-    # Forms
-    # -------------------------
-
-    forms = soup.find_all("form")
-
-    # -------------------------
-    # Schema / JSON-LD
-    # -------------------------
-
-    json_ld = soup.find_all(
-        "script",
-        attrs={
-            "type": "application/ld+json"
-        }
-    )
-
-    # -------------------------
-    # Mixed content
-    # -------------------------
-
-    mixed_content = []
-
-    if parsed.scheme == "https":
-
-        for tag in soup.find_all(src=True):
-
-            src = urljoin(
-                response.url,
-                tag.get("src")
-            )
-
-            if src.startswith("http://"):
-                mixed_content.append(src[:250])
-
-        for tag in soup.find_all(href=True):
-
-            href = urljoin(
-                response.url,
-                tag.get("href")
-            )
-
-            if href.startswith("http://"):
-                mixed_content.append(href[:250])
-
+    internal = external = 0
+    for a in links:
+        q = urlparse(urljoin(r.url,a["href"]))
+        if q.netloc:
+            if q.netloc == p.netloc: internal += 1
+            else: external += 1
+    scripts = [urljoin(r.url,x["src"]) for x in soup.find_all("script",src=True)]
+    css = [urljoin(r.url,x["href"]) for x in soup.find_all("link",href=True,rel=lambda x:x and "stylesheet" in x)]
+    imgs = [urljoin(r.url,x.get("src")) for x in images if x.get("src")]
+    mixed = []
+    if p.scheme == "https":
+        for x in soup.find_all(src=True):
+            q=urljoin(r.url,x.get("src"))
+            if q.startswith("http://"): mixed.append(q[:300])
+        for x in soup.find_all(href=True):
+            q=urljoin(r.url,x.get("href"))
+            if q.startswith("http://"): mixed.append(q[:300])
+    unlabeled = 0
+    for x in soup.find_all(["input","textarea","select"]):
+        iid=x.get("id")
+        if not ((iid and soup.find("label",attrs={"for":iid})) or x.get("aria-label") or x.get("aria-labelledby")):
+            unlabeled += 1
     return {
-
-        "url": response.url,
-
-        "status_code":
-            response.status_code,
-
-        "content_type":
-            response.headers.get(
-                "content-type",
-                ""
-            ),
-
-        "server":
-            response.headers.get(
-                "server"
-            ),
-
-        "response_time_seconds":
-            round(
-                response.elapsed.total_seconds(),
-                3
-            ),
-
-        "page_size_kb":
-            round(
-                len(response.content) / 1024,
-                2
-            ),
-
-        "title":
-            title,
-
-        "title_length":
-            len(title),
-
-        "meta_description":
-            meta_description,
-
-        "meta_description_length":
-            len(meta_description),
-
-        "canonical":
-            canonical,
-
-        "robots_meta":
-            robots,
-
-        "viewport":
-            viewport,
-
-        "language":
-            language,
-
-        "headings":
-            headings,
-
-        "images_total":
-            len(images),
-
-        "images_without_alt":
-            images_without_alt[:100],
-
-        "links_total":
-            len(links),
-
-        "internal_links":
-            internal_links,
-
-        "external_links":
-            external_links,
-
-        "scripts":
-            len(scripts),
-
-        "stylesheets":
-            len(stylesheets),
-
-        "forms":
-            len(forms),
-
-        "structured_data_count":
-            len(json_ld),
-
-        "mixed_content":
-            mixed_content[:100],
+        "final_url":r.url,"status_code":r.status_code,"content_type":r.headers.get("content-type",""),
+        "server":r.headers.get("server"),"content_encoding":r.headers.get("content-encoding"),
+        "cache_control":r.headers.get("cache-control"),"etag":r.headers.get("etag"),
+        "page_size_kb":round(len(r.content)/1024,2),"title":title,"title_length":len(title),
+        "meta_description":desc,"meta_description_length":len(desc),
+        "canonical":can.get("href","").strip() if can else "",
+        "robots_meta":robots.get("content","").strip() if robots else "",
+        "viewport":viewport.get("content","").strip() if viewport else "",
+        "language":html.get("lang") if html else None,
+        "headings":{f"h{i}":len(soup.find_all(f"h{i}")) for i in range(1,7)},
+        "images_total":len(images),"images_without_alt":no_alt[:100],
+        "links_total":len(links),"internal_links":internal,"external_links":external,
+        "scripts":len(scripts),"script_urls":scripts[:40],"stylesheets":len(css),"stylesheet_urls":css[:40],
+        "forms":len(soup.find_all("form")),"unlabeled_form_controls":unlabeled,
+        "structured_data_count":len(soup.find_all("script",attrs={"type":"application/ld+json"})),
+        "mixed_content":mixed[:100],"image_urls":imgs[:40]
     }
 
-
-# ============================================================
-# SECURITY ANALYSIS
-# ============================================================
-
-def get_tls_information(hostname):
-
+def tls_info(host):
     try:
+        ctx=ssl.create_default_context()
+        with socket.create_connection((host,443),timeout=8) as sock:
+            with ctx.wrap_socket(sock,server_hostname=host) as tls:
+                cert=tls.getpeercert()
+                return {"tls_version":tls.version(),"cipher":tls.cipher()[0] if tls.cipher() else None,
+                        "certificate_subject":str(cert.get("subject")),"certificate_issuer":str(cert.get("issuer"))}
+    except Exception as e: return {"error":str(e)}
 
-        context = ssl.create_default_context()
-
-        with socket.create_connection(
-            (hostname, 443),
-            timeout=8
-        ) as sock:
-
-            with context.wrap_socket(
-                sock,
-                server_hostname=hostname
-            ) as tls:
-
-                certificate = tls.getpeercert()
-
-                return {
-
-                    "tls_version":
-                        tls.version(),
-
-                    "cipher":
-                        tls.cipher()[0]
-                        if tls.cipher()
-                        else None,
-
-                    "certificate_subject":
-                        str(
-                            certificate.get(
-                                "subject"
-                            )
-                        ),
-
-                    "certificate_issuer":
-                        str(
-                            certificate.get(
-                                "issuer"
-                            )
-                        ),
-                }
-
-    except Exception as e:
-
-        return {
-            "error": str(e)
-        }
-
-
-def analyze_security(url, response):
-
-    parsed = urlparse(response.url)
-
-    headers = {
-        key.lower(): value
-        for key, value
-        in response.headers.items()
+def security(r):
+    p=urlparse(r.url); h={k.lower():v for k,v in r.headers.items()}
+    desc={
+        "content-security-policy":"Controls browser resource execution.",
+        "strict-transport-security":"Helps force HTTPS.",
+        "x-content-type-options":"Reduces MIME sniffing.",
+        "x-frame-options":"Helps reduce clickjacking.",
+        "referrer-policy":"Controls referrer information.",
+        "permissions-policy":"Controls browser capabilities."
     }
+    headers={k:{"present":k in h,"value":h.get(k),"description":v} for k,v in desc.items()}
+    return {"https":p.scheme=="https","headers":headers,"server":r.headers.get("server"),
+            "x_powered_by":r.headers.get("x-powered-by"),
+            "tls":tls_info(p.hostname) if p.scheme=="https" else None}
 
-    security_headers = {
-
-        "content-security-policy":
-            "Protects against many forms of XSS and unwanted resource execution.",
-
-        "strict-transport-security":
-            "Forces browsers to use HTTPS.",
-
-        "x-content-type-options":
-            "Helps prevent MIME type sniffing.",
-
-        "x-frame-options":
-            "Helps protect against clickjacking.",
-
-        "referrer-policy":
-            "Controls referrer information.",
-
-        "permissions-policy":
-            "Controls browser features and permissions.",
-    }
-
-    header_results = {}
-
-    for name, description in security_headers.items():
-
-        header_results[name] = {
-
-            "present":
-                name in headers,
-
-            "value":
-                headers.get(name),
-
-            "description":
-                description,
-        }
-
-    # -------------------------
-    # Cookies
-    # -------------------------
-
-    cookies = []
-
-    set_cookie = response.headers.get(
-        "set-cookie",
-        ""
-    )
-
-    if set_cookie:
-
-        cookie_parts = re.split(
-            r",(?=\s*[^;,=]+=[^;,]+)",
-            set_cookie
-        )
-
-        for cookie in cookie_parts[:50]:
-
-            parts = cookie.split(";")
-
-            first = parts[0].strip()
-
-            if "=" not in first:
-                continue
-
-            cookie_name = first.split(
-                "=",
-                1
-            )[0]
-
-            attributes = [
-                part.strip().lower()
-                for part in parts[1:]
-            ]
-
-            cookies.append({
-
-                "name":
-                    cookie_name,
-
-                "secure":
-                    "secure" in attributes,
-
-                "httponly":
-                    "httponly" in attributes,
-
-                "samesite":
-                    any(
-                        item.startswith(
-                            "samesite"
-                        )
-                        for item in attributes
-                    ),
-            })
-
-    tls = None
-
-    if parsed.scheme == "https":
-
-        tls = get_tls_information(
-            parsed.hostname
-        )
-
-    return {
-
-        "https":
-            parsed.scheme == "https",
-
-        "security_headers":
-            header_results,
-
-        "cookies":
-            cookies,
-
-        "server":
-            response.headers.get(
-                "server"
-            ),
-
-        "x_powered_by":
-            response.headers.get(
-                "x-powered-by"
-            ),
-
-        "tls":
-            tls,
-    }
-
-
-# ============================================================
-# ROBOTS / SITEMAP
-# ============================================================
-
-def check_robots_and_sitemap(url):
-
-    results = {}
-
-    for path in [
-        "/robots.txt",
-        "/sitemap.xml"
-    ]:
-
-        target = urljoin(
-            url,
-            path
-        )
-
+def discover(url,s):
+    out={}
+    for path in ("/robots.txt","/sitemap.xml"):
         try:
-
-            response = requests.get(
-                target,
-                headers={
-                    "User-Agent":
-                        USER_AGENT
-                },
-                timeout=10
-            )
-
-            results[path] = {
-
-                "exists":
-                    response.ok,
-
-                "status":
-                    response.status_code,
-
-                "preview":
-                    response.text[:2000]
-                    if response.ok
-                    else "",
-            }
-
-        except Exception as e:
-
-            results[path] = {
-
-                "exists":
-                    False,
-
-                "error":
-                    str(e),
-            }
-
-    return results
-
-
-# ============================================================
-# PLAYWRIGHT PERFORMANCE AUDIT
-# ============================================================
-
-def browser_audit(url):
-
-    result = {
-
-        "navigation_time_ms": None,
-
-        "dom_content_loaded_ms": None,
-
-        "load_event_ms": None,
-
-        "first_contentful_paint_ms": None,
-
-        "largest_contentful_paint_ms": None,
-
-        "cumulative_layout_shift": None,
-
-        "request_count": 0,
-
-        "failed_requests": [],
-
-        "resource_summary": {},
-
-        "console_errors": [],
-
-        "page_title": "",
-    }
-
-    with sync_playwright() as p:
-
-        browser = p.chromium.launch(
-            headless=True
-        )
-
-        page = browser.new_page(
-            viewport={
-                "width": 1280,
-                "height": 720
-            }
-        )
-
-        resources = []
-
-        failed_requests = []
-
-        console_errors = []
-
-        page.on(
-            "response",
-            lambda response:
-            resources.append({
-                "url":
-                    response.url,
-                "status":
-                    response.status,
-                "resource_type":
-                    response.request.resource_type,
-            })
-        )
-
-        page.on(
-            "requestfailed",
-            lambda request:
-            failed_requests.append({
-                "url":
-                    request.url,
-                "failure":
-                    request.failure,
-            })
-        )
-
-        page.on(
-            "console",
-            lambda msg:
-            console_errors.append(
-                msg.text
-            )
-            if msg.type == "error"
-            else None
-        )
-
-        start = time.perf_counter()
-
-        page.goto(
-            url,
-            wait_until="networkidle",
-            timeout=60000
-        )
-
-        navigation_time = (
-            time.perf_counter() - start
-        ) * 1000
-
-        # Give browser performance APIs
-        # time to populate.
-
-        time.sleep(1)
-
-        metrics = page.evaluate(
-            """
-            () => {
-
-                const navigation =
-                    performance.getEntriesByType(
-                        'navigation'
-                    )[0];
-
-                const paints =
-                    performance.getEntriesByType(
-                        'paint'
-                    );
-
-                let fcp = null;
-
-                for (const paint of paints) {
-
-                    if (
-                        paint.name ===
-                        'first-contentful-paint'
-                    ) {
-                        fcp = paint.startTime;
-                    }
-                }
-
-                return {
-
-                    domContentLoaded:
-                        navigation
-                        ? navigation.domContentLoadedEventEnd
-                        : null,
-
-                    loadEvent:
-                        navigation
-                        ? navigation.loadEventEnd
-                        : null,
-
-                    fcp: fcp,
-
-                    resourceCount:
-                        performance
-                        .getEntriesByType(
-                            'resource'
-                        ).length
-                };
-            }
-            """
-        )
-
-        # LCP
-        lcp = page.evaluate(
-            """
-            () => new Promise(resolve => {
-
-                let value = null;
-
-                try {
-
-                    const observer =
-                        new PerformanceObserver(
-                            list => {
-
-                                const entries =
-                                    list.getEntries();
-
-                                if (entries.length) {
-
-                                    value =
-                                        entries[
-                                            entries.length - 1
-                                        ].startTime;
-                                }
-                            }
-                        );
-
-                    observer.observe({
-                        type: 'largest-contentful-paint',
-                        buffered: true
-                    });
-
-                } catch (e) {}
-
-                setTimeout(
-                    () => resolve(value),
-                    500
-                );
-            })
-            """
-        )
-
-        # CLS
-        cls = page.evaluate(
-            """
-            () => {
-
-                let value = 0;
-
-                try {
-
-                    const entries =
-                        performance.getEntriesByType(
-                            'layout-shift'
-                        );
-
-                    for (
-                        const entry of entries
-                    ) {
-
-                        if (
-                            !entry.hadRecentInput
-                        ) {
-
-                            value +=
-                                entry.value;
-                        }
-                    }
-
-                } catch (e) {}
-
-                return value;
-            }
-            """
-        )
-
-        result["navigation_time_ms"] = round(
-            navigation_time,
-            2
-        )
-
-        result["dom_content_loaded_ms"] = (
-            round(
-                metrics["domContentLoaded"],
-                2
-            )
-            if metrics["domContentLoaded"]
-            else None
-        )
-
-        result["load_event_ms"] = (
-            round(
-                metrics["loadEvent"],
-                2
-            )
-            if metrics["loadEvent"]
-            else None
-        )
-
-        result["first_contentful_paint_ms"] = (
-            round(
-                metrics["fcp"],
-                2
-            )
-            if metrics["fcp"]
-            else None
-        )
-
-        result["largest_contentful_paint_ms"] = (
-            round(
-                lcp,
-                2
-            )
-            if lcp
-            else None
-        )
-
-        result["cumulative_layout_shift"] = (
-            round(cls, 4)
-            if cls is not None
-            else None
-        )
-
-        result["request_count"] = (
-            len(resources)
-        )
-
-        result["failed_requests"] = (
-            failed_requests[:100]
-        )
-
-        result["console_errors"] = (
-            console_errors[:50]
-        )
-
-        result["resource_summary"] = {
-
-            "documents":
-                len([
-                    r for r in resources
-                    if r["resource_type"]
-                    == "document"
-                ]),
-
-            "scripts":
-                len([
-                    r for r in resources
-                    if r["resource_type"]
-                    == "script"
-                ]),
-
-            "stylesheets":
-                len([
-                    r for r in resources
-                    if r["resource_type"]
-                    == "stylesheet"
-                ]),
-
-            "images":
-                len([
-                    r for r in resources
-                    if r["resource_type"]
-                    == "image"
-                ]),
-
-            "fonts":
-                len([
-                    r for r in resources
-                    if r["resource_type"]
-                    == "font"
-                ]),
-
-            "xhr_fetch":
-                len([
-                    r for r in resources
-                    if r["resource_type"]
-                    in ["xhr", "fetch"]
-                ]),
-        }
-
-        result["page_title"] = page.title()
-
-        browser.close()
-
-    return result
-
-
-# ============================================================
-# LOCAL FINDINGS
-# ============================================================
-
-def generate_findings(audit):
-
-    findings = []
-
-    html = audit["html"]
-    security = audit["security"]
-    performance = audit["performance"]
-
-    # SEO
-    if not html["title"]:
-
-        findings.append({
-            "severity": "High",
-            "category": "SEO",
-            "issue": "Missing page title",
-        })
-
-    elif not 10 <= html["title_length"] <= 60:
-
-        findings.append({
-            "severity": "Medium",
-            "category": "SEO",
-            "issue":
-                f"Title length is {html['title_length']} characters.",
-        })
-
-    if not html["meta_description"]:
-
-        findings.append({
-            "severity": "High",
-            "category": "SEO",
-            "issue":
-                "Missing meta description.",
-        })
-
-    if html["images_without_alt"]:
-
-        findings.append({
-            "severity": "High",
-            "category": "Accessibility",
-            "issue":
-                f"{len(html['images_without_alt'])} images are missing alt text.",
-        })
-
-    if html["headings"]["h1"] == 0:
-
-        findings.append({
-            "severity": "Medium",
-            "category": "SEO",
-            "issue":
-                "No H1 heading detected.",
-        })
-
-    if html["headings"]["h1"] > 1:
-
-        findings.append({
-            "severity": "Low",
-            "category": "SEO",
-            "issue":
-                "Multiple H1 headings detected.",
-        })
-
-    if not html["canonical"]:
-
-        findings.append({
-            "severity": "Medium",
-            "category": "SEO",
-            "issue":
-                "Canonical URL was not detected.",
-        })
-
-    if not html["viewport"]:
-
-        findings.append({
-            "severity": "High",
-            "category": "Mobile",
-            "issue":
-                "Viewport meta tag is missing.",
-        })
-
-    # Security
-    if not security["https"]:
-
-        findings.append({
-            "severity": "Critical",
-            "category": "Security",
-            "issue":
-                "Website is not using HTTPS.",
-        })
-
-    important_headers = [
-        "content-security-policy",
-        "strict-transport-security",
-        "x-content-type-options",
-        "x-frame-options",
-    ]
-
-    for header in important_headers:
-
-        if not security[
-            "security_headers"
-        ][header]["present"]:
-
-            findings.append({
-                "severity": "Medium",
-                "category": "Security",
-                "issue":
-                    f"Missing security header: {header}",
-            })
-
-    # Performance
-    fcp = performance[
-        "first_contentful_paint_ms"
-    ]
-
-    if fcp and fcp > 3000:
-
-        findings.append({
-            "severity": "High",
-            "category": "Performance",
-            "issue":
-                f"First Contentful Paint is approximately {fcp:.0f} ms.",
-        })
-
-    lcp = performance[
-        "largest_contentful_paint_ms"
-    ]
-
-    if lcp and lcp > 4000:
-
-        findings.append({
-            "severity": "High",
-            "category": "Performance",
-            "issue":
-                f"Large Contentful Paint is approximately {lcp:.0f} ms.",
-        })
-
-    if performance["request_count"] > 150:
-
-        findings.append({
-            "severity": "Medium",
-            "category": "Performance",
-            "issue":
-                f"High number of network requests: {performance['request_count']}.",
-        })
-
-    if performance["failed_requests"]:
-
-        findings.append({
-            "severity": "Medium",
-            "category": "Technical",
-            "issue":
-                f"{len(performance['failed_requests'])} network requests failed.",
-        })
-
-    return findings
-
-
-# ============================================================
-# GEMINI
-# ============================================================
-
-def generate_gemini_report(url, audit):
-
-    api_key = st.secrets.get(
-        "GEMINI_API_KEY"
-    )
-
-    if not api_key:
-
-        raise RuntimeError(
-            "GEMINI_API_KEY is missing from Streamlit Secrets."
-        )
-
-    client = genai.Client(
-        api_key=api_key
-    )
-
-    prompt = f"""
-You are a senior website auditor and technical SEO expert.
-
-Analyze the following passive website audit.
-
-Website:
-{url}
-
-AUDIT DATA:
-{json.dumps(
-    audit,
-    indent=2,
-    default=str
-)[:100000]}
-
-Create a professional Markdown report containing:
-
-# Website Audit Report
-
-## 1. Executive Summary
-
-Give a concise overview.
-
-## 2. Overall Assessment
-
-Discuss the general quality of the website.
-
-## 3. SEO Audit
-
-Analyze:
-- Title
-- Meta description
-- Headings
-- Canonical
-- Robots
-- Sitemap
-- Images
-- Internal links
-- Structured data
-- Crawlability signals
-
-## 4. Performance Audit
-
-Analyze:
-- Navigation/load time
-- FCP
-- LCP
-- CLS
-- Number of requests
-- JavaScript
-- CSS
-- Images
-- Failed requests
-
-Explain what should be improved.
-
-## 5. Security Audit
-
-Analyze:
-- HTTPS
-- Security headers
-- Cookies
-- TLS
-- Mixed content
-
-IMPORTANT:
-Do NOT claim that a vulnerability is confirmed merely because
-a security header is missing.
-
-Clearly distinguish:
-- Confirmed observations
-- Potential risks
-- Things that were not tested
-
-This is a passive audit and NOT a penetration test.
-
-## 6. Accessibility Audit
-
-Discuss the available accessibility signals.
-
-## 7. Technical Audit
-
-Discuss:
-- HTTP status
-- HTML structure
-- resources
-- JavaScript
-- forms
-- links
-- structured data
-
-## 8. Mobile / Responsive Audit
-
-Discuss mobile-related findings based on the collected data.
-
-## 9. Priority Issues
-
-Create a table:
-
-| Priority | Category | Issue | Why it matters | Recommended fix |
-|---|---|---|---|---|
-
-Use Critical, High, Medium, Low.
-
-## 10. Recommended Action Plan
-
-Give the top 10 practical improvements in order.
-
-Be technically accurate.
-
-Never invent data that does not exist in the audit.
-"""
-
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-    )
-
-    return response.text
-
-
-# ============================================================
-# STREAMLIT UI
-# ============================================================
+            r=s.get(urljoin(url,path),timeout=10,allow_redirects=True)
+            out[path]={"exists":r.ok,"status":r.status_code,"content_type":r.headers.get("content-type"),"preview":r.text[:2500] if r.ok else ""}
+        except Exception as e: out[path]={"exists":False,"error":str(e)}
+    return out
+
+def resource_check(url,s):
+    try:
+        start=time.perf_counter(); r=s.head(url,timeout=8,allow_redirects=True)
+        if r.status_code >= 400 or r.status_code == 405:
+            start=time.perf_counter(); r=s.get(url,timeout=8,allow_redirects=True,stream=True)
+        return {"url":url,"status":r.status_code,"response_time_ms":round((time.perf_counter()-start)*1000,2),
+                "content_type":r.headers.get("content-type"),"content_length":r.headers.get("content-length"),
+                "cache_control":r.headers.get("cache-control"),"content_encoding":r.headers.get("content-encoding")}
+    except Exception as e: return {"url":url,"status":None,"error":str(e)}
+
+def resource_audit(html):
+    s=requests.Session(); s.headers.update({"User-Agent":UA})
+    urls=list(dict.fromkeys(html["script_urls"][:20]+html["stylesheet_urls"][:20]+html["image_urls"][:20]))
+    items=[resource_check(u,s) for u in urls]
+    ok=[x for x in items if x.get("status") and x["status"]<400]
+    failed=[x for x in items if not x.get("status") or x["status"]>=400]
+    times=[x["response_time_ms"] for x in ok if x.get("response_time_ms") is not None]
+    return {"checked":len(items),"successful":len(ok),"failed":len(failed),"failed_resources":failed[:50],
+            "average_response_time_ms":round(sum(times)/len(times),2) if times else None,
+            "slow_resources":[x for x in ok if x.get("response_time_ms",0)>1000][:50]}
+
+def findings(a):
+    h=a["html"]; sec=a["security"]; res=a["resources"]; f=[]
+    def add(sev,cat,msg): f.append({"severity":sev,"category":cat,"issue":msg})
+    if not h["title"]: add("High","SEO","Missing page title.")
+    elif not 10<=h["title_length"]<=60: add("Medium","SEO",f"Title length is {h['title_length']} characters.")
+    if not h["meta_description"]: add("High","SEO","Missing meta description.")
+    if h["headings"]["h1"]==0: add("Medium","SEO","No H1 heading detected.")
+    if h["headings"]["h1"]>1: add("Low","SEO","Multiple H1 headings detected.")
+    if not h["canonical"]: add("Medium","SEO","Canonical URL not detected.")
+    if h["images_without_alt"]: add("High","Accessibility",f"{len(h['images_without_alt'])} images appear to be missing alt text.")
+    if h["unlabeled_form_controls"]: add("High","Accessibility",f"{h['unlabeled_form_controls']} form controls may lack accessible labels.")
+    if not h["viewport"]: add("High","Mobile","Viewport meta tag is missing.")
+    if not h["language"]: add("Low","Accessibility","HTML language attribute is missing.")
+    if not sec["https"]: add("Critical","Security","Website is not using HTTPS.")
+    for x in ("content-security-policy","strict-transport-security","x-content-type-options","x-frame-options"):
+        if not sec["headers"][x]["present"]: add("Medium","Security",f"Missing security header: {x}.")
+    if h["mixed_content"]: add("High","Security",f"{len(h['mixed_content'])} HTTP resources found on an HTTPS page.")
+    if h["page_size_kb"]>3000: add("High","Performance",f"Initial HTML document is {h['page_size_kb']} KB.")
+    if h["scripts"]>30: add("Medium","Performance",f"{h['scripts']} external JavaScript files detected.")
+    if h["images_total"]>50: add("Medium","Performance",f"{h['images_total']} images detected.")
+    if res["failed"]: add("Medium","Technical",f"{res['failed']} sampled resources failed or were unreachable.")
+    if res["slow_resources"]: add("Medium","Performance",f"{len(res['slow_resources'])} sampled resources took over 1 second.")
+    return f
+
+def gemini_report(url,a):
+    key=st.secrets.get("GEMINI_API_KEY")
+    if not key: raise RuntimeError("GEMINI_API_KEY is missing from Streamlit Secrets.")
+    client=genai.Client(api_key=key)
+    prompt=f"""You are a senior website auditor, technical SEO expert, performance analyst, accessibility reviewer, and security reviewer.
+Analyze this PASSIVE audit data for {url}:
+{json.dumps(a,indent=2,default=str)[:110000]}
+Create a professional Markdown report with:
+# AI Website Audit Report
+## Executive Summary
+## Overall Assessment
+## SEO Audit
+## Performance Audit
+## Accessibility Audit
+## Security Audit
+## Technical Audit
+## Mobile/Responsive Signals
+## Priority Issues (table: Priority | Category | Issue | Evidence | Recommended Fix)
+## Top 10 Recommendations
+## What Was NOT Tested
+Be accurate. Do not invent data. Do not claim a missing security header is an exploitable vulnerability.
+Do not claim SQL injection, XSS, RCE, auth bypass, CSRF, etc. was found unless the evidence proves it.
+This is a passive audit, not a penetration test. Do not claim LCP, CLS, FCP or Core Web Vitals were measured."""
+    return client.models.generate_content(model="gemini-2.5-flash",contents=prompt).text
 
 st.title("🔎 AI Website Auditor")
-
-st.markdown(
-    """
-Enter any **public website URL** and generate a detailed audit
-covering **SEO, Performance, Security, Accessibility and Technical
-issues** using real browser measurements and Gemini AI.
-"""
-)
-
+st.caption("No PageSpeed API • No Playwright • SEO • Performance • Security • Accessibility • Gemini AI")
 with st.sidebar:
+    st.header("Settings")
+    use_gemini=st.checkbox("Generate Gemini report",True)
+    check_resources=st.checkbox("Check sampled JS/CSS/images",True)
+    st.info("Passive checks only. No exploitation, brute force, authentication bypass, or destructive testing.")
 
-    st.header("Audit Settings")
-
-    mobile = st.checkbox(
-        "Mobile viewport",
-        value=False
-    )
-
-    use_gemini = st.checkbox(
-        "Generate Gemini AI report",
-        value=True
-    )
-
-    st.divider()
-
-    st.info(
-        """
-Security testing is passive.
-
-This application does not:
-- exploit vulnerabilities
-- brute force
-- bypass authentication
-- attack endpoints
-- perform destructive penetration testing
-"""
-    )
-
-
-url_input = st.text_input(
-    "Website URL",
-    placeholder="https://example.com"
-)
-
-
-if st.button(
-    "🚀 Run Complete Audit",
-    type="primary",
-    use_container_width=True
-):
-
+url_input=st.text_input("Website URL",placeholder="https://example.com")
+if st.button("🚀 Run Website Audit",type="primary",use_container_width=True):
+    try: url=normalize_url(url_input)
+    except ValueError as e: st.error(str(e)); st.stop()
+    progress=st.progress(0); status=st.empty()
     try:
-
-        url = normalize_url(
-            url_input
-        )
-
-    except ValueError as e:
-
-        st.error(str(e))
-        st.stop()
-
-    progress = st.progress(0)
-
-    status = st.empty()
-
-    try:
-
-        # -----------------------------
-        # HTTP
-        # -----------------------------
-
-        status.write(
-            "🌐 Fetching website..."
-        )
-
-        response, fetch_time = (
-            fetch_website(url)
-        )
-
-        progress.progress(15)
-
-        # -----------------------------
-        # HTML
-        # -----------------------------
-
-        status.write(
-            "🔍 Analyzing SEO and HTML..."
-        )
-
-        html = analyze_html(
-            url,
-            response
-        )
-
-        progress.progress(30)
-
-        # -----------------------------
-        # Security
-        # -----------------------------
-
-        status.write(
-            "🛡️ Analyzing security..."
-        )
-
-        security = analyze_security(
-            url,
-            response
-        )
-
-        progress.progress(45)
-
-        # -----------------------------
-        # Robots/Sitemap
-        # -----------------------------
-
-        status.write(
-            "🤖 Checking robots.txt and sitemap..."
-        )
-
-        discovery = (
-            check_robots_and_sitemap(
-                response.url
-            )
-        )
-
-        progress.progress(55)
-
-        # -----------------------------
-        # Browser performance
-        # -----------------------------
-
-        status.write(
-            "⚡ Running browser performance audit..."
-        )
-
-        performance = browser_audit(
-            response.url
-        )
-
-        progress.progress(75)
-
-        # -----------------------------
-        # Complete data
-        # -----------------------------
-
-        audit = {
-
-            "website":
-                response.url,
-
-            "fetch_time":
-                fetch_time,
-
-            "html":
-                html,
-
-            "security":
-                security,
-
-            "discovery":
-                discovery,
-
-            "performance":
-                performance,
-        }
-
-        # -----------------------------
-        # Findings
-        # -----------------------------
-
-        findings = generate_findings(
-            audit
-        )
-
-        audit["findings"] = findings
-
-        progress.progress(85)
-
-        # -----------------------------
-        # Gemini
-        # -----------------------------
-
-        if use_gemini:
-
-            status.write(
-                "🤖 Gemini is analyzing the website..."
-            )
-
-            gemini_report = (
-                generate_gemini_report(
-                    response.url,
-                    audit
-                )
-            )
-
-        else:
-
-            gemini_report = (
-                "Gemini report disabled."
-            )
-
-        progress.progress(100)
-
-        status.write(
-            "✅ Audit completed."
-        )
-
-        st.session_state[
-            "audit"
-        ] = audit
-
-        st.session_state[
-            "gemini_report"
-        ] = gemini_report
-
-    except Exception as e:
-
-        st.error(
-            f"Audit failed: {str(e)}"
-        )
-
-        st.stop()
-
-
-# ============================================================
-# RESULTS
-# ============================================================
+        status.write("🌐 Fetching website..."); r,ft=fetch(url); progress.progress(20)
+        status.write("🔍 Analyzing HTML and SEO..."); h=analyze_html(r); progress.progress(40)
+        status.write("🛡️ Analyzing security..."); sec=security(r); progress.progress(55)
+        status.write("🤖 Checking robots.txt and sitemap..."); s=requests.Session(); s.headers.update({"User-Agent":UA}); d=discover(r.url,s); progress.progress(65)
+        status.write("⚡ Checking sampled resources..."); res=resource_audit(h) if check_resources else {"checked":0,"successful":0,"failed":0,"failed_resources":[],"average_response_time_ms":None,"slow_resources":[]}; progress.progress(80)
+        a={"website":r.url,"initial_fetch_time_seconds":round(ft,3),"html":h,"security":sec,"discovery":d,"resources":res}
+        a["findings"]=findings(a)
+        report=gemini_report(r.url,a) if use_gemini else "Gemini report disabled."
+        progress.progress(100); status.write("✅ Audit completed.")
+        st.session_state["audit"]=a; st.session_state["report"]=report
+    except requests.RequestException as e: st.error(f"Could not fetch the website: {e}"); st.stop()
+    except Exception as e: st.error(f"Audit failed: {e}"); st.stop()
 
 if "audit" in st.session_state:
-
-    audit = st.session_state[
-        "audit"
-    ]
-
-    html = audit["html"]
-
-    performance = audit[
-        "performance"
-    ]
-
-    security = audit[
-        "security"
-    ]
-
-    findings = audit[
-        "findings"
-    ]
-
-    st.divider()
-
-    st.header("📊 Audit Overview")
-
-    columns = st.columns(5)
-
-    metrics = [
-
-        (
-            "HTTP Status",
-            html["status_code"]
-        ),
-
-        (
-            "Load Time",
-            f"{performance['navigation_time_ms']} ms"
-        ),
-
-        (
-            "FCP",
-            f"{performance['first_contentful_paint_ms']} ms"
-            if performance[
-                "first_contentful_paint_ms"
-            ]
-            else "N/A"
-        ),
-
-        (
-            "LCP",
-            f"{performance['largest_contentful_paint_ms']} ms"
-            if performance[
-                "largest_contentful_paint_ms"
-            ]
-            else "N/A"
-        ),
-
-        (
-            "Requests",
-            performance[
-                "request_count"
-            ]
-        ),
-    ]
-
-    for column, (label, value) in zip(
-        columns,
-        metrics
-    ):
-
-        column.metric(
-            label,
-            value
-        )
-
-    # ========================================================
-    # FINDINGS
-    # ========================================================
-
-    st.header("🚨 Detected Issues")
-
-    if not findings:
-
-        st.success(
-            "No obvious issues were detected."
-        )
-
-    else:
-
-        severity_order = {
-            "Critical": 0,
-            "High": 1,
-            "Medium": 2,
-            "Low": 3,
-        }
-
-        findings = sorted(
-            findings,
-            key=lambda item:
-                severity_order.get(
-                    item["severity"],
-                    99
-                )
-        )
-
-        for finding in findings:
-
-            st.markdown(
-                f"""
-**{finding['severity']}** ·
-{finding['category']}
-
-{finding['issue']}
-"""
-            )
-
-    # ========================================================
-    # TABS
-    # ========================================================
-
-    tabs = st.tabs(
-        [
-            "🤖 Gemini Report",
-            "🔍 SEO",
-            "⚡ Performance",
-            "🛡️ Security",
-            "♿ Accessibility",
-            "🧰 Technical",
-            "📦 Raw Data",
-        ]
-    )
-
-    # ========================================================
-    # GEMINI
-    # ========================================================
-
-    with tabs[0]:
-
-        st.markdown(
-            st.session_state[
-                "gemini_report"
-            ]
-        )
-
-    # ========================================================
-    # SEO
-    # ========================================================
-
+    a=st.session_state["audit"]; h=a["html"]; res=a["resources"]; sec=a["security"]
+    st.divider(); st.header("📊 Overview")
+    c=st.columns(5)
+    c[0].metric("HTTP Status",h["status_code"]); c[1].metric("Initial Response",f"{a['initial_fetch_time_seconds']} s")
+    c[2].metric("HTML Size",f"{h['page_size_kb']} KB"); c[3].metric("Scripts",h["scripts"]); c[4].metric("Resources Checked",res["checked"])
+    st.header("🚨 Findings")
+    order={"Critical":0,"High":1,"Medium":2,"Low":3}
+    fs=sorted(a["findings"],key=lambda x:order.get(x["severity"],99))
+    if not fs: st.success("No obvious issues were detected by passive checks.")
+    for x in fs: st.markdown(f"**{x['severity']}** · {x['category']} — {x['issue']}")
+    tabs=st.tabs(["🤖 Gemini Report","🔍 SEO","⚡ Performance","🛡️ Security","♿ Accessibility","🧰 Technical","📦 Raw Data"])
+    with tabs[0]: st.markdown(st.session_state["report"])
     with tabs[1]:
-
-        st.subheader(
-            "SEO Analysis"
-        )
-
-        st.write(
-            "**Title:**",
-            html["title"]
-            or "Missing"
-        )
-
-        st.write(
-            "**Title length:**",
-            html["title_length"]
-        )
-
-        st.write(
-            "**Meta description:**",
-            html["meta_description"]
-            or "Missing"
-        )
-
-        st.write(
-            "**Meta description length:**",
-            html[
-                "meta_description_length"
-            ]
-        )
-
-        st.write(
-            "**Canonical:**",
-            html["canonical"]
-            or "Missing"
-        )
-
-        st.write(
-            "**Robots meta:**",
-            html["robots_meta"]
-            or "Not specified"
-        )
-
-        st.write(
-            "**Language:**",
-            html["language"]
-            or "Missing"
-        )
-
-        st.write(
-            "**H1:**",
-            html["headings"]["h1"]
-        )
-
-        st.write(
-            "**Images:**",
-            html["images_total"]
-        )
-
-        st.write(
-            "**Images without alt:**",
-            len(
-                html[
-                    "images_without_alt"
-                ]
-            )
-        )
-
-        st.write(
-            "**Internal links:**",
-            html["internal_links"]
-        )
-
-        st.write(
-            "**External links:**",
-            html["external_links"]
-        )
-
-        st.write(
-            "**Structured data blocks:**",
-            html[
-                "structured_data_count"
-            ]
-        )
-
-        st.write(
-            "**robots.txt:**",
-            "Found"
-            if audit[
-                "discovery"
-            ]["/robots.txt"].get(
-                "exists"
-            )
-            else "Not found"
-        )
-
-        st.write(
-            "**sitemap.xml:**",
-            "Found"
-            if audit[
-                "discovery"
-            ]["/sitemap.xml"].get(
-                "exists"
-            )
-            else "Not found"
-        )
-
-    # ========================================================
-    # PERFORMANCE
-    # ========================================================
-
+        for label,key in [("Title","title"),("Meta description","meta_description"),("Canonical","canonical"),("Robots meta","robots_meta"),("Language","language"),("Viewport","viewport")]: st.write(f"**{label}:**",h[key] or "Missing")
+        st.write("**Title length:**",h["title_length"]); st.write("**Meta description length:**",h["meta_description_length"])
+        st.write("**Headings:**",h["headings"]); st.write("**Images:**",h["images_total"]); st.write("**Images missing alt:**",len(h["images_without_alt"]))
+        st.write("**Internal links:**",h["internal_links"]); st.write("**External links:**",h["external_links"]); st.write("**Structured data:**",h["structured_data_count"])
+        st.write("**robots.txt:**","Found" if a["discovery"]["/robots.txt"].get("exists") else "Not found"); st.write("**sitemap.xml:**","Found" if a["discovery"]["/sitemap.xml"].get("exists") else "Not found")
     with tabs[2]:
-
-        st.subheader(
-            "Browser Performance"
-        )
-
-        performance_display = {
-
-            "Navigation time":
-                performance[
-                    "navigation_time_ms"
-                ],
-
-            "DOM Content Loaded":
-                performance[
-                    "dom_content_loaded_ms"
-                ],
-
-            "Load event":
-                performance[
-                    "load_event_ms"
-                ],
-
-            "First Contentful Paint":
-                performance[
-                    "first_contentful_paint_ms"
-                ],
-
-            "Largest Contentful Paint":
-                performance[
-                    "largest_contentful_paint_ms"
-                ],
-
-            "Cumulative Layout Shift":
-                performance[
-                    "cumulative_layout_shift"
-                ],
-
-            "Network requests":
-                performance[
-                    "request_count"
-                ],
-
-            "Failed requests":
-                len(
-                    performance[
-                        "failed_requests"
-                    ]
-                ),
-        }
-
-        st.json(
-            performance_display
-        )
-
-        st.subheader(
-            "Resource Breakdown"
-        )
-
-        st.json(
-            performance[
-                "resource_summary"
-            ]
-        )
-
-    # ========================================================
-    # SECURITY
-    # ========================================================
-
+        st.metric("Initial HTTP Response",f"{a['initial_fetch_time_seconds']} s"); st.metric("HTML Size",f"{h['page_size_kb']} KB")
+        st.metric("Average Sampled Resource Response",f"{res['average_response_time_ms']} ms" if res["average_response_time_ms"] else "N/A")
+        st.write("**Scripts:**",h["scripts"]); st.write("**Stylesheets:**",h["stylesheets"]); st.write("**Images:**",h["images_total"]); st.write("**Failed sampled resources:**",res["failed"])
+        if res["slow_resources"]: st.subheader("Slow resources"); st.json(res["slow_resources"])
+        st.caption("This version does not claim Core Web Vitals because it uses neither PageSpeed API nor browser automation.")
     with tabs[3]:
-
-        st.subheader(
-            "Security Configuration"
-        )
-
-        st.write(
-            "**HTTPS:**",
-            "Enabled"
-            if security["https"]
-            else "Not enabled"
-        )
-
-        st.subheader(
-            "Security Headers"
-        )
-
-        for (
-            header,
-            data
-        ) in security[
-            "security_headers"
-        ].items():
-
-            if data["present"]:
-
-                st.success(
-                    f"✓ {header}"
-                )
-
-            else:
-
-                st.warning(
-                    f"⚠ Missing: {header}"
-                )
-
-        st.subheader(
-            "TLS"
-        )
-
-        st.json(
-            security["tls"]
-            or {}
-        )
-
-        if security["cookies"]:
-
-            st.subheader(
-                "Cookie Security"
-            )
-
-            st.json(
-                security["cookies"]
-            )
-
-        st.warning(
-            "These are passive security observations. "
-            "Missing headers do not by themselves prove "
-            "that the website is vulnerable."
-        )
-
-    # ========================================================
-    # ACCESSIBILITY
-    # ========================================================
-
+        st.write("**HTTPS:**","Enabled" if sec["https"] else "Not enabled")
+        for name,x in sec["headers"].items(): (st.success if x["present"] else st.warning)(f"{'✓' if x['present'] else '⚠'} {name}")
+        st.subheader("TLS"); st.json(sec["tls"] or {})
+        st.warning("Passive configuration findings do not prove exploitability.")
     with tabs[4]:
-
-        st.subheader(
-            "Accessibility Signals"
-        )
-
-        st.write(
-            "**Images without alt:**",
-            len(
-                html[
-                    "images_without_alt"
-                ]
-            )
-        )
-
-        st.write(
-            "**Viewport:**",
-            html["viewport"]
-            or "Missing"
-        )
-
-        st.write(
-            "**HTML language:**",
-            html["language"]
-            or "Missing"
-        )
-
-        st.write(
-            "**H1 headings:**",
-            html["headings"]["h1"]
-        )
-
-        st.write(
-            "**Forms:**",
-            html["forms"]
-        )
-
-    # ========================================================
-    # TECHNICAL
-    # ========================================================
-
+        st.write("**Images missing alt:**",len(h["images_without_alt"])); st.write("**Unlabeled form controls:**",h["unlabeled_form_controls"])
+        st.write("**Viewport:**",h["viewport"] or "Missing"); st.write("**HTML language:**",h["language"] or "Missing"); st.write("**H1:**",h["headings"]["h1"])
     with tabs[5]:
-
-        st.subheader(
-            "Technical Information"
-        )
-
-        st.json({
-
-            "url":
-                html["url"],
-
-            "status":
-                html["status_code"],
-
-            "content_type":
-                html["content_type"],
-
-            "page_size_kb":
-                html["page_size_kb"],
-
-            "scripts":
-                html["scripts"],
-
-            "stylesheets":
-                html["stylesheets"],
-
-            "forms":
-                html["forms"],
-
-            "mixed_content":
-                html["mixed_content"],
-
-            "failed_requests":
-                performance[
-                    "failed_requests"
-                ],
-
-            "console_errors":
-                performance[
-                    "console_errors"
-                ],
-        })
-
-    # ========================================================
-    # RAW
-    # ========================================================
-
+        st.json({"final_url":h["final_url"],"status":h["status_code"],"content_type":h["content_type"],"server":h["server"],"compression":h["content_encoding"],"cache_control":h["cache_control"],"etag":h["etag"],"page_size_kb":h["page_size_kb"],"scripts":h["scripts"],"stylesheets":h["stylesheets"],"forms":h["forms"],"mixed_content":h["mixed_content"],"failed_resources":res["failed_resources"]})
     with tabs[6]:
-
-        st.json(
-            audit
-        )
-
-        st.download_button(
-            "⬇️ Download Audit JSON",
-            data=json.dumps(
-                audit,
-                indent=2,
-                default=str
-            ),
-            file_name=(
-                "website_audit.json"
-            ),
-            mime="application/json",
-        )
+        st.json(a)
+        st.download_button("⬇️ Download Audit JSON",json.dumps(a,indent=2,default=str),"website_audit.json","application/json")

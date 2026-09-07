@@ -180,7 +180,7 @@ Create a professional Markdown report with:
 Be accurate. Do not invent data. Do not claim a missing security header is an exploitable vulnerability.
 Do not claim SQL injection, XSS, RCE, auth bypass, CSRF, etc. was found unless the evidence proves it.
 This is a passive audit, not a penetration test. Do not claim LCP, CLS, FCP or Core Web Vitals were measured."""
-    return client.models.generate_content(model="gemini-2.5-flash",contents=prompt).text
+    return client.models.generate_content(model="gemini-3.6-flash",contents=prompt).text
 
 st.title("🔎 AI Website Auditor")
 st.caption("No PageSpeed API • No Playwright • SEO • Performance • Security • Accessibility • Gemini AI")
